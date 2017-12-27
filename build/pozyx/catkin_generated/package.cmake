@@ -1,0 +1,7 @@
+set(_CATKIN_CURRENT_PACKAGE "pozyx")
+set(pozyx_MAINTAINER "bs <bs@todo.todo>")
+set(pozyx_DEPRECATED "")
+set(pozyx_VERSION "0.0.0")
+set(pozyx_BUILD_DEPENDS "roscpp" "rospy" "std_msgs")
+set(pozyx_RUN_DEPENDS "roscpp" "rospy" "std_msgs")
+set(pozyx_BUILDTOOL_DEPENDS "catkin")

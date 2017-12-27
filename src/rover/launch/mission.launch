@@ -1,0 +1,26 @@
+<launch>
+
+	<!-- Publish orientation data from IMU -->
+	<!-- <node pkg="rover" name="IMUfusion" type="IMUfusion.py" /> -->
+	
+	<!-- Publish range information from IR sensors -->
+	<!-- <node pkg="rover" name="ranger" type="ranger.py" /> -->
+	
+	<!-- Publish position information from encoders -->
+	<node pkg="rover" name="localiser" type="localiser.py" />
+	
+	<!-- Convert motion model from unicycle to differential drive -->
+	<node pkg="rover" name="convertor_u2d" type="convertor_u2d.py" />
+	
+	<!-- Send motion commands to motors -->
+	<node pkg="rover" name="motor_driver" type="motor_driver.py"/>
+	
+	<!-- Finite state machine contorller -->
+	<node pkg="rover" name="fstate_machine" type="fstate_machine.py" />
+	
+</launch>	
+	
+	
+	
+	
+	

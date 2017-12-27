@@ -1,0 +1,679 @@
+#!/usr/bin/env python
+
+##Aim: Finite state machine switching between various controllers 
+##Subcribes : local_goal, R_pose
+##Publishes : velocity_command
+##
+#PPV: The local_goal should be published only once.
+#---------------------------------------------
+import Adafruit_BBIO.GPIO as GPIO
+import Adafruit_BBIO.ADC as ADC
+import numpy as np
+
+ADC.setup()
+import rospy
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import LaserScan
+
+global pose_x
+global pose_y
+global pose_theta
+global time
+
+pose_x = 0.0
+pose_y = 0.0
+pose_theta = 0.0
+
+def pub_vel(v, w):
+    #Function to publish desired linear
+    #and angular velocity of the robot
+    
+    p = rospy.Publisher('velocity_command', Twist, queue_size = 10)
+        
+    msg = Twist()
+    msg.linear.x = v
+    msg.angular.z = w
+    p.publish(msg)
+    
+    #Keep logs of published data
+    #rospy.loginfo('velocity command')
+    #rospy.loginfo(msg.linear.x)
+    #rospy.loginfo(msg.angular.z)    
+    return
+
+def localise(): 
+    #To get the latest pose information
+    
+    global pose_x
+    global pose_y
+    global pose_theta
+    
+    X = pose_x
+    Y = pose_y
+    Theta = pose_theta
+    loc = [X, Y, Theta]
+
+    return loc
+
+def IR_Ranger(msg):
+    #To get the IR range data
+    
+    global IR_Range
+    
+    IR_Range = msg.ranges
+    
+    return   
+  
+def robot_getsonarrange(num):
+    #Function to return IR reading in mm
+    
+    global IR_Range    
+    
+    reading = IR_Range[num]
+    
+    return reading
+
+#########################SUPPORT##############################################
+def obstacle_reading():
+    #Function to compute obstacle point from range sensors
+    
+    #get the current robot location
+    _, _, thetaa = localise()
+    
+    #Get sonar readings
+    pi = np.pi
+    sonoffset = [-(pi/2.0), -(pi/4.0), 0.0, (pi/4.0), (pi/2.0)]
+    sonweight = [4, 2, 5, 2, 4]
+           
+    readings = []
+  
+    for i in range(len(sonoffset)):
+        r = robot_getsonarrange(i)
+        r = r*sonweight[i]
+        angl = thetaa - sonoffset[i]
+        delx = r*np.cos(angl)
+        dely = r*np.sin(angl)
+        readings.append([(delx, dely)])
+          
+    return np.mean(readings, axis=0)
+    
+def fw_tanvec(side):
+    #The follow vector calculator for Follow Wall behavior   
+    
+    #The follow wall threshold distance
+    dfw = 600.0
+    
+    #get the current robot location
+    _, _, thetaa = localise()
+    
+    pi = np.pi
+    sonoffset = [-(pi/2.0), -(pi/4.0), 0.0, (pi/4.0), (pi/2.0)]
+           
+    readings = []
+    
+    if side == 'l':
+        for i in [0, 1]:
+            r = robot_getsonarrange(i)
+            angl = thetaa - sonoffset[i]
+            delx = r*np.cos(angl)
+            dely = r*np.sin(angl)
+            readings.append([(delx, dely)])
+            
+    else:            
+        for i in [4, 3]:
+            r = robot_getsonarrange(i)
+            angl = thetaa - sonoffset[i]
+            delx = r*np.cos(angl)
+            dely = r*np.sin(angl)
+            readings.append([(delx, dely)])
+            
+    Ufw_t = np.subtract(readings[1],readings[0])                  
+    Upfw_t = Ufw_t/np.linalg.norm(Ufw_t)    
+    temp = (np.dot(readings[0], Upfw_t))*Upfw_t    
+    Ufw_p = readings[0] - temp
+    Upfw_p = Ufw_p - (dfw*(Ufw_p/np.linalg.norm(Ufw_p)))
+    Upfw_p = Upfw_p/(np.linalg.norm(Upfw_p))
+    Ufw = (Upfw_p + (4.0*Upfw_t))/5.0
+    
+    return Ufw    
+    
+##########################EVENTS###############
+def at_goal():
+    #Event which checks if we have reached the goal(within threshold)     
+    
+    global goal
+    
+    #The threshold distance 
+    distThresh = 50#mm
+    
+    xd = goal[0]
+    yd = goal[1]
+    
+    #get the current robot location
+    xa, ya,_ = localise()
+    
+    #check if we have reached goal point
+    d = np.sqrt(pow((xd - xa),2) + pow((yd - ya),2))
+    
+    if d <= distThresh:
+        print "Reached goal"
+        return True
+    else:
+        return False
+        
+def at_obstacle():
+    #Event which checks if we have detected any obstacle (within safe distance)
+    
+    #The safe distance
+    d_safe = 1000
+    
+    for i in range(5):
+        r = robot_getsonarrange(i)
+        if r < d_safe:
+            print "Obstacle detected"
+            return True
+
+    return False 
+    
+def unsafe():
+    #Event which checks if we have detected any obstacle (within unsafe distance)
+    
+    #The unsafe distance
+    d_unsafe = 500.0
+    
+    for i in range(5):
+        r = robot_getsonarrange(i)
+        if r < d_unsafe:
+            print "Unsafe"
+            return True
+            
+    return False
+
+def obstacle_cleared():
+    #Event which checks if we have cleared all obstacle (within safe distance)
+    
+    #The safe distance
+    d_safe = 1000
+    
+    for i in range(5):
+        r = robot_getsonarrange(i)
+        if r < d_safe:            
+            return False
+
+    print "Obstacle cleared"            
+    return True
+    
+def no_progress():
+    #Event which checks progress
+    #If made ==> sets it
+    #If not ==>  checks it and raises flag
+    
+    global goal
+    global dprogress
+    
+    xd = goal[0]
+    yd = goal[1]
+    
+    #Epsilon slack
+    E = 300.0        
+    
+    #get the current robot location
+    xa, ya, _ = localise()
+    
+    #check if we have reached goal point
+    d = np.sqrt(pow((xd - xa),2) + pow((yd - ya),2))
+    
+    #The first setting
+    if dprogress < 0:
+        dprogress = d
+        return False
+        
+    if dprogress > d:
+        #Progress made
+        dprogress = d
+        print "progress made"
+        return False
+    elif d > (dprogress + E):
+        #progress not made        
+        print "No progress"
+        return True
+    else:
+        return False                                   
+
+def chk_wall(side):
+    #Event to check whether to continue following the given side
+    
+    global goal
+    
+    xd = goal[0]
+    yd = goal[1]
+    
+    #get the current robot location
+    xa, ya, _ = localise()    
+    
+    #The normalized gtg vector
+    Ugtg = [((xd - xa),(yd - ya))]
+    Ugtg = Ugtg/np.linalg.norm(Ugtg)
+    
+    #The normalized ao vector
+    [[Uao]] = obstacle_reading()
+    Uao = Uao/np.linalg.norm(Uao)        
+    
+    #The normalized follow wall vector
+    Ufw = fw_tanvec(side)
+    Ufw = Ufw/np.linalg.norm(Ufw) 
+    
+    a = np.array([[Ugtg[0], Uao[0]],[Ugtg[1], Uao[1]]])
+    c = np.array([[Ufw[0]], [Ufw[1]]])
+    
+    Sigma = np.dot(np.linalg.pinv(a),c)
+    
+    if Sigma[0][0] > 0 and Sigma[1][0] > 0:
+        return True
+    else:        
+        print "wall follow stopped"
+        return False
+
+###########################GUARD################################################
+def guard(num):
+    #The Guard Function
+    #1.sets fire to desired controller
+    #2.resets the controller errors
+    
+    #Controller errors
+    global prev_heading_error
+    global total_heading_error
+    global fire
+    global flag_change
+    
+    prev_heading_error = 0.0
+    total_heading_error = 0.0
+    
+    fire = num
+    flag_change = True
+    
+    return    
+
+##################CONTROLLERS###################################################
+def gtg():
+    #The Go to goal controller
+    
+    global goal
+    global prev_heading_error
+    global total_heading_error   
+    global flag_change
+    global time
+    
+    if flag_change:
+        print "Go to goal controller engaged"
+        flag_change = False
+    
+    #Controller parameters
+    Kp = 0.075
+    Kd = 2.0
+    Ki = 0.0
+    
+    xd = goal[0]
+    yd = goal[1]
+    
+    #get the current robot location
+    xa, ya, thetaa = localise()
+    
+    #determine how far to rotate to face the goal point
+    #PS. ALL ANGLES ARE IN RADIANS
+    dt = (np.arctan2((yd - ya), (xd -xa))) - thetaa
+    #restrict angle to (-pi,pi)
+    dt = ((dt + np.pi)%(2.0*np.pi)) - np.pi
+    dt = ((dt*180.0)/np.pi)
+    
+    #Angular velocity parameters
+    angleThresh = 5#degrees
+    ang_stalllimit = 0#rad/s 
+        
+    if abs(dt) > angleThresh:
+        #control input for angular velocity
+        W = (Kp*dt) + (Ki*total_heading_error) + (Kd*(dt - prev_heading_error))
+        total_heading_error = total_heading_error + dt
+        prev_heading_error = dt
+	
+	if (W > 0 and W < ang_stalllimit):
+	    W = ang_stalllimit
+	elif (W < 0 and W > (-1*ang_stalllimit)):
+	    W = -1*ang_stalllimit
+
+    else:
+        W = 0
+
+  
+    #find distance to goal
+    d = np.sqrt(pow((xd - xa),2) + pow((yd - ya),2))
+    
+    #velocity parameters
+    velMult = 500#mm/s
+    distThresh = 10#mm
+    lin_stalllimit = 0#mm/s
+    
+    #control input for linear velocity
+    V = ((np.arctan((d - distThresh)/100)) - (np.arctan(dt/20)))*velMult + lin_stalllimit
+    
+    if (V > 0 and V < lin_stalllimit):
+	V = lin_stalllimit
+    elif (V < 0 and V > (-1*lin_stalllimit)):
+	V = -1*lin_stalllimit
+
+    print "V :", V, "W :", W
+    #request robot to execute velocity
+    pub_vel(V,W)
+    
+    #Check events
+    if at_goal():
+        #call stop_robot()
+        guard(5)
+    #elif at_obstacle():
+    #    #call ao_gtg()
+    #    guard(2)
+    #elif no_progress:
+    #    if chk_wall('l'):
+    #        #call fw('l')
+    #        guard(41)
+    #    else:
+    #        #call fw('r')
+    #        guard(42)
+                                       
+    return                     
+    
+def ao_gtg():
+    #The Avoid obstacle and Go to goal controller
+    
+    global goal
+    global prev_heading_error
+    global total_heading_error 
+    global flag_change
+    
+    if flag_change:
+        print "Avoid obstacle and Go to goal controller engaged"
+        flag_change = False
+    
+    #Controller parameters
+    Kp = 0.2;
+    Kd = 0.0;
+    Ki = 0.0;
+    
+    xd = goal[0]
+    yd = goal[1]
+    
+    #get the current robot location
+    xa, ya, thetaa = localise()
+    
+    #determine how far to rotate to face the goal point
+    #PS. ALL ANGLES ARE IN RADIANS
+    dt = (np.arctan2((yd - ya), (xd -xa))) - thetaa
+    #restrict angle to (-pi,pi)
+    dtgtg = ((dt + np.pi)%(2.0*np.pi)) - np.pi
+    
+    #Get obstacle point reading from sensors
+    [[obs_x, obs_y]] = obstacle_reading()
+    
+    #Determine how far to rotate to avoid obstacle
+    dt =  (np.arctan2(obs_x,obs_y))- thetaa
+    #restrict angle to (-pi,pi)
+    dtao = ((dt + np.pi)%(2.0*np.pi)) - np.pi
+ 
+    #Combining both in 1:3 ratio 
+    dtnet = (dtgtg + (3.0*dtao))/4.0
+    dtnet = ((dtnet*180.0)/np.pi)
+    
+    #control input for angular velocity
+    W = (Kp*dtnet) + (Ki*total_heading_error) + (Kd*(dtnet - prev_heading_error))
+    total_heading_error = total_heading_error + dtnet
+    prev_heading_error = dtnet
+    
+    #velocity parameters
+    velMult = 50#mm/s
+    
+    #set constant linear velocity
+    V = velMult
+    
+    #request robot to execute velocity
+    pub_vel(V,W)
+    
+    #Check events
+    if at_goal():
+        #call stop_robot()
+        guard(5)
+    elif unsafe():
+        #call ao()
+        guard(3)
+    elif no_progress:
+        if chk_wall('l'):
+            #call fw('l')
+            guard(41)
+        else:
+            #call fw('r')
+            guard(42)
+    elif obstacle_cleared():
+        #call gtg()
+        guard(1)            
+                                       
+    return                
+    
+def ao():
+    #The Avoid obstacle controller
+    
+    global prev_heading_error
+    global total_heading_error 
+    global flag_change
+    
+    if flag_change:
+        print "Avoid obstacle controller engaged"
+        flag_change = False
+    
+    #Controller parameters
+    Kp = 0.2;
+    Kd = 0.0;
+    Ki = 0.0;
+
+    #get the current robot location
+    _, _, thetaa = localise()
+    
+    #Get obstacle point reading from sensors
+    [[obs_x, obs_y]] = obstacle_reading()
+    
+    #Determine how far to rotate to avoid obstacle
+    dt =  (np.arctan2(obs_x,obs_y))- thetaa
+    #restrict angle to (-pi,pi)
+    dt = ((dt + np.pi)%(2.0*np.pi)) - np.pi
+    dt = ((dt*180.0)/np.pi)
+    
+    #control input for angular velocity
+    W = (Kp*dt) + (Ki*total_heading_error) + (Kd*(dt - prev_heading_error))
+    total_heading_error = total_heading_error + dt
+    prev_heading_error = dt
+    
+    #velocity parameters
+    velMult = 20#mm/s
+    
+    #set constant linear velocity
+    V = velMult
+    
+    #request robot to execute velocity
+    pub_vel(V,W)
+    
+    #Check events
+    if at_goal():
+        #call stop_robot()
+        guard(5)
+    elif obstacle_cleared():
+        #call ao_gtg()
+        guard(2)            
+                                       
+    return
+        
+def fw(side):
+    #The Follow Wall Controller
+    
+    global prev_heading_error
+    global total_heading_error 
+    global flag_change
+    
+    if flag_change:
+        print "Follow wall controller engaged on ", side
+        flag_change = False
+    
+    
+    #Controller parameters
+    Kp = 0.2;
+    Kd = 0.0;
+    Ki = 0.0;        
+    
+    #get the current robot location
+    _, _, thetaa = localise()
+    
+    #get the follow wall vector
+    fw_x, fw_y = fw_tanvec(side)
+    
+    #Determine how far to rotate to follow wall
+    dt =  (np.arctan2(fw_x, fw_y))- thetaa
+    #restrict angle to (-pi,pi)
+    dt = ((dt + np.pi)%(2.0*np.pi)) - np.pi
+ 
+    #control input for angular velocity
+    W = (Kp*dt) + (Ki*total_heading_error) + (Kd*(dt - prev_heading_error))
+    total_heading_error = total_heading_error + dt
+    prev_heading_error = dt
+    
+    #velocity parameters
+    velMult = 75#mm/s
+    
+    #set constant linear velocity
+    V = velMult
+    
+    #request robot to execute velocity
+    pub_vel(V,W)
+    
+    #Check events
+    if at_goal():
+        #call stop_robot()
+        guard(5)
+    elif ((not no_progress()) and (not chk_wall(side))):
+        #call ao_gtg()
+        guard(2)            
+                                       
+    return
+              
+def stop_robot():
+    #The controller to stop the robot
+    
+    global fire
+    global flag_change
+    
+    if flag_change:
+        print "Stop controller engaged"
+        flag_change = False
+    
+    pub_vel(0.0, 0.0)
+    fire = 0   
+    
+    print "System exit"
+    return
+
+######################################################################
+    
+def turn_off():
+    #Function for safe shutdown 
+    
+    print('Finite State Machine turning off')
+    stop_robot()
+    pub_vel(0.0, 0.0)
+    return
+
+def pose_update(msg):
+    #Function to update pose information
+    
+    global pose_x
+    global pose_y
+    global pose_theta
+    
+    pose_x = msg.linear.x
+    pose_y = msg.linear.y
+    pose_theta = msg.angular.z
+    return
+
+def auto_drv(msg):
+    #The auto driv engager
+    
+    global goal
+    global fire
+    global dprogress
+    global flag_change
+    global time
+    
+    Xi = msg.linear.x
+    Yi = msg.linear.y
+    goal = [Xi, Yi]
+    
+    #The progress variable initialization
+    dprogress = -1
+    
+    print "Auto Drive engaged:::\n"
+    
+    #It all begins with the Go to goal controller(Gtg)
+    guard(1)
+    flag_change = True
+    time = 0.0
+    
+    #Begin the controller loop
+    #Till there burns the fire
+    while fire:
+      
+        if fire == 1:
+            gtg()
+            continue
+        elif fire == 2:
+            ao_gtg()
+            continue         
+        elif fire == 3:
+            ao()    
+            continue    
+        elif fire == 41:
+            fw('l') 
+            continue               
+        elif fire == 42:
+            fw('r')
+            continue
+        else:
+            stop_robot()
+                                 
+    return
+        
+def main():
+    
+    #Initialising             
+    rospy.init_node('fstate_machine')
+    rospy.on_shutdown(turn_off)
+
+    print('Finite State Machine running')
+    #rospy.Subscriber("local_goal", Twist, auto_drv)
+    rospy.Subscriber("R_pose", Twist, pose_update)
+    rospy.Subscriber("Range_data", LaserScan, IR_Ranger)
+    msg = Twist()
+    msg.linear.x = 700.0
+    msg.linear.y = 0.0
+    print "d"
+    auto_drv(msg)
+    msg.linear.x = 700.0
+    msg.linear.y = 700.0
+	    auto_drv(msg)
+    msg.linear.x = 0.0
+    msg.linear.y = 700.0
+    auto_drv(msg)
+    msg.linear.x = 0.0
+    msg.linear.y = 0.0
+    auto_drv(msg)
+    rospy.spin()    
+
+if __name__ == '__main__':
+    try:
+        main()
+    except rospy.ROSInterruptException:	
+        pass
